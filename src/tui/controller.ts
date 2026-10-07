@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin/tui"
 
 import { GptLive, type TaskStatus, type Voice } from "../shared/rpc"
 import { HelperProcess, ensureHelper, type HelperEvent } from "./helper"
+import { syncCallModel, type CallModel } from "./model"
 import { arrivalsFor, type Phase } from "./visuals"
 
 type Context = Plugin.Context
@@ -71,7 +72,9 @@ export class VoiceController {
   private readonly listeners = new Set<() => void>()
   private helper: HelperProcess | undefined
   private readonly unsubscribe: Array<() => void> = []
-  private starting = false
+  private starting: number | undefined
+  private generation = 0
+  private disposed = false
 
   constructor(
     private readonly context: Context,
@@ -109,7 +112,8 @@ export class VoiceController {
 
   private subscribe() {
     const rpc = this.rpc()
-    const mine = (event: { data: { callID: string } }) => event.data.callID === this.state.callID
+    const mine = (event: { data: { callID: string } }) =>
+      !this.disposed && this.active && this.state.phase !== "closing" && event.data.callID === this.state.callID
     this.unsubscribe.push(
       rpc.events.on("state", (event) => {
         if (!mine(event)) return
@@ -152,9 +156,11 @@ export class VoiceController {
     )
   }
 
-  async start(sessionID: string, voice?: Voice, fresh = false) {
-    if (this.active || this.starting) return
-    this.starting = true
+  async start(sessionID: string, model: CallModel | undefined, voice?: Voice, fresh = false) {
+    if (this.disposed || this.active || this.starting !== undefined) return
+    const generation = ++this.generation
+    this.starting = generation
+    const current = () => !this.disposed && this.generation === generation
     const session = this.context.data.session.get(sessionID) as { location?: Location } | undefined
     const location = session?.location ?? this.context.location ?? this.context.data.location.default()
     Object.assign(this.state, initial(), {
@@ -166,11 +172,18 @@ export class VoiceController {
     })
     this.notice("Connecting to GPT-Live…", "info")
     try {
-      const binary = await ensureHelper((message) => this.context.ui.toast.show({ message, variant: "info" }))
+      await syncCallModel(this.context, sessionID, model)
+      if (!current()) return
+      const binary = await ensureHelper((message) => {
+        if (current()) this.context.ui.toast.show({ message, variant: "info" })
+      })
+      if (!current()) return
       const helper = new HelperProcess(binary, {
-        onEvent: (event) => this.onHelperEvent(event),
+        onEvent: (event) => {
+          if (current() && this.helper === helper) this.onHelperEvent(event)
+        },
         onExit: (code, stderr) => {
-          if (this.helper !== helper) return
+          if (!current() || this.helper !== helper) return
           this.helper = undefined
           if (this.active)
             void this.stop(code ? `Audio stopped unexpectedly: ${stderr.trim().split("\n").pop() ?? code}` : undefined)
@@ -186,10 +199,18 @@ export class VoiceController {
         output: output ? (output === "none" ? "none" : { file: output }) : undefined,
         duck: this.options.duck,
       })
+      if (!current()) return
       const call = await this.rpc().start(
         { sessionID, sdp: offer, voice: voice ?? this.options.voice, fresh },
         { location },
       )
+      if (!current()) {
+        // stop() could not know the call ID while this request was pending.
+        await this.rpc()
+          .stop({ callID: call.callID }, { location })
+          .catch(() => undefined)
+        return
+      }
       const past = call.previous.map((turn): Entry => ({
         id: nextID(),
         kind: turn.role,
@@ -211,15 +232,17 @@ export class VoiceController {
       for (const notice of call.notices ?? []) this.notice(notice, "info")
       this.heartbeat(call.callID)
       await helper.answer(call.sdp)
+      if (!current()) return
       if (this.state.phase === "connecting") this.markLive()
     } catch (error) {
-      await this.teardown(describeError(error))
+      if (current()) await this.teardown(describeError(error))
     } finally {
-      this.starting = false
+      if (this.starting === generation) this.starting = undefined
     }
   }
 
   async stop(failure?: string) {
+    this.invalidateStart()
     if (!this.active) return
     this.set({ phase: "closing" })
     const { callID, location } = this.state
@@ -232,8 +255,15 @@ export class VoiceController {
 
   private tearingDown = false
 
+  private invalidateStart() {
+    const attempt = this.generation
+    this.generation++
+    if (this.starting === attempt) this.starting = undefined
+  }
+
   private async teardown(failure?: string, reason?: string) {
     if (this.state.phase === "idle" || this.state.phase === "error" || this.tearingDown) return
+    this.invalidateStart()
     this.tearingDown = true
     try {
       await this.finishTeardown(failure, reason)
@@ -382,6 +412,7 @@ export class VoiceController {
   }
 
   async dispose() {
+    this.disposed = true
     for (const stop of this.unsubscribe.splice(0)) stop()
     await this.stop()
     this.listeners.clear()
