@@ -314,16 +314,18 @@ where
 }
 
 /// Renders mono speaker samples, handling prebuffering after underruns and clear requests.
-struct Renderer {
+pub(super) struct Renderer {
     playback: HeapCons<f32>,
     reference: HeapProd<f32>,
     control: Arc<PlaybackControl>,
     starved: bool,
     prebuffer: usize,
+    waited: usize,
+    max_wait: usize,
 }
 
 impl Renderer {
-    fn new(
+    pub(super) fn new(
         playback: HeapCons<f32>,
         reference: HeapProd<f32>,
         control: Arc<PlaybackControl>,
@@ -336,16 +338,31 @@ impl Renderer {
             starved: true,
             // 60 ms of jitter absorption before speech starts playing.
             prebuffer: rate as usize * 60 / 1000,
+            waited: 0,
+            // A short response or tail must not wait for another utterance to reach 60 ms.
+            max_wait: rate as usize / 10,
         }
     }
 
-    fn render(&mut self, out: &mut [f32]) {
-        if self.control.clear.swap(false, Ordering::AcqRel) {
+    pub(super) fn render(&mut self, out: &mut [f32]) {
+        if self.control.clear.load(Ordering::Acquire) {
             self.playback.clear();
             self.starved = true;
+            self.waited = 0;
+            // The engine must not refill the ring until it has been emptied.
+            self.control.clear.store(false, Ordering::Release);
         }
-        if self.starved && self.playback.occupied_len() >= self.prebuffer {
-            self.starved = false;
+        if self.starved {
+            let available = self.playback.occupied_len();
+            if available > 0 {
+                self.waited = self.waited.saturating_add(out.len());
+                if available >= self.prebuffer || self.waited >= self.max_wait {
+                    self.starved = false;
+                    self.waited = 0;
+                }
+            } else {
+                self.waited = 0;
+            }
         }
         let read = if self.starved {
             0
@@ -541,5 +558,44 @@ fn run_virtual_output(
     }
     if let Some(writer) = writer {
         let _ = writer.finalize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_response_plays_without_waiting_for_the_next_turn() {
+        let (mut prod, cons) = HeapRb::<f32>::new(200).split();
+        let (reference, _) = HeapRb::<f32>::new(200).split();
+        let mut renderer =
+            Renderer::new(cons, reference, Arc::new(PlaybackControl::default()), 1000);
+        prod.push_slice(&[0.5; 20]);
+        let mut out = [0.0; 10];
+        for _ in 0..9 {
+            renderer.render(&mut out);
+            assert_eq!(out, [0.0; 10]);
+        }
+        renderer.render(&mut out);
+        assert_eq!(out, [0.5; 10]);
+        renderer.render(&mut out);
+        assert_eq!(out, [0.5; 10]);
+    }
+
+    #[test]
+    fn normal_prebuffer_starts_immediately_and_clear_discards_it() {
+        let (mut prod, cons) = HeapRb::<f32>::new(200).split();
+        let (reference, _) = HeapRb::<f32>::new(200).split();
+        let control = Arc::new(PlaybackControl::default());
+        let mut renderer = Renderer::new(cons, reference, control.clone(), 1000);
+        prod.push_slice(&[0.5; 60]);
+        let mut out = [0.0; 10];
+        renderer.render(&mut out);
+        assert_eq!(out, [0.5; 10]);
+        control.clear.store(true, Ordering::Release);
+        renderer.render(&mut out);
+        assert_eq!(out, [0.0; 10]);
+        assert!(renderer.playback.is_empty());
     }
 }
