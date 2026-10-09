@@ -129,6 +129,115 @@ async function flush() {
 }
 
 describe("delegated task outcomes", () => {
+  test("each queued answer is spoken before the shared execution goes idle", async () => {
+    const { bridge, sideband, statuses, stream, prompt } = harness()
+    const first = bridge.send("Task A")
+    prompt().resolve({ id: "inbox_a" })
+    await first
+    stream.emit({ type: "session.inbox.delivered", data: { sessionID: "main", inboxID: "inbox_a" } })
+    stream.emit({ type: "session.execution.started", data: { sessionID: "main" } })
+    await settle()
+
+    const second = bridge.send("Task B")
+    prompt().resolve({ id: "inbox_b" })
+    await second
+    stream.emit({ type: "session.step.started", data: { sessionID: "main", assistantMessageID: "answer_a" } })
+    stream.emit({ type: "session.text.ended", data: { sessionID: "main", text: "A is done" } })
+    stream.emit({
+      type: "session.step.ended",
+      data: { sessionID: "main", assistantMessageID: "answer_a", finish: "stop" },
+    })
+    await settle()
+
+    expect(sideband.spoken).toEqual(["The coding session replied: A is done"])
+    expect(statuses).not.toContain("task_1:done")
+    expect(statuses).not.toContain("task_2:done")
+    expect(bridge.status()).toContain("The main session is working")
+
+    stream.emit({ type: "session.inbox.delivered", data: { sessionID: "main", inboxID: "inbox_b" } })
+    stream.emit({ type: "session.step.started", data: { sessionID: "main", assistantMessageID: "answer_b" } })
+    stream.emit({ type: "session.text.ended", data: { sessionID: "main", text: "B is done" } })
+    stream.emit({
+      type: "session.step.ended",
+      data: { sessionID: "main", assistantMessageID: "answer_b", finish: "stop" },
+    })
+    await settle()
+
+    const expected = ["The coding session replied: A is done", "The coding session replied: B is done"]
+    expect(sideband.spoken).toEqual(expected)
+    expect(statuses).not.toContain("task_1:done")
+    expect(statuses).not.toContain("task_2:done")
+    stream.emit({ type: "session.execution.succeeded", data: { sessionID: "main" } })
+    await settle()
+    expect(sideband.spoken).toEqual(expected)
+    expect(statuses).toContain("task_1:done")
+    expect(statuses).toContain("task_2:done")
+    expect(bridge.status()).toContain("The main session is idle")
+    bridge.close()
+  })
+
+  test("tool steps are not announced and their text cannot become a later answer", async () => {
+    const { bridge, sideband, stream, prompt } = harness()
+    const pending = bridge.send("Inspect the project")
+    prompt().resolve({ id: "inbox_1" })
+    await pending
+    stream.emit({ type: "session.inbox.delivered", data: { sessionID: "main", inboxID: "inbox_1" } })
+    stream.emit({ type: "session.execution.started", data: { sessionID: "main" } })
+    stream.emit({ type: "session.step.started", data: { sessionID: "main", assistantMessageID: "tools" } })
+    stream.emit({ type: "session.text.ended", data: { sessionID: "main", text: "I will inspect the files" } })
+    stream.emit({ type: "session.step.ended", data: { sessionID: "main", finish: "tool-calls" } })
+    await settle()
+    expect(sideband.spoken).toEqual([])
+
+    stream.emit({ type: "session.step.started", data: { sessionID: "main", assistantMessageID: "answer" } })
+    stream.emit({
+      type: "session.step.ended",
+      data: { sessionID: "main", assistantMessageID: "answer", finish: "stop" },
+    })
+    await settle()
+    expect(sideband.spoken).toEqual([])
+    stream.emit({ type: "session.execution.succeeded", data: { sessionID: "main" } })
+    await settle()
+    expect(sideband.spoken).toEqual(['Finished the task "Inspect the project".'])
+    bridge.close()
+  })
+
+  test("one answer can cover overlapping requests without assigning individual completions", async () => {
+    const { bridge, sideband, statuses, stream, prompt } = harness()
+    const first = bridge.send("Task A")
+    prompt().resolve({ id: "inbox_a" })
+    await first
+    stream.emit({ type: "session.inbox.delivered", data: { sessionID: "main", inboxID: "inbox_a" } })
+    stream.emit({ type: "session.execution.started", data: { sessionID: "main" } })
+    const second = bridge.send("Also answer B", "steer")
+    prompt().resolve({ id: "inbox_b" })
+    await second
+    stream.emit({ type: "session.inbox.delivered", data: { sessionID: "main", inboxID: "inbox_b" } })
+    stream.emit({ type: "session.step.started", data: { sessionID: "main", assistantMessageID: "combined" } })
+    stream.emit({ type: "session.text.ended", data: { sessionID: "main", ordinal: 0, text: "Answer A." } })
+    stream.emit({ type: "session.text.ended", data: { sessionID: "main", ordinal: 1, text: "Answer B." } })
+    stream.emit({
+      type: "session.step.ended",
+      data: { sessionID: "main", assistantMessageID: "other", finish: "stop" },
+    })
+    await settle()
+    expect(sideband.spoken).toEqual([])
+    stream.emit({
+      type: "session.step.ended",
+      data: { sessionID: "main", assistantMessageID: "combined", finish: "stop" },
+    })
+    await settle()
+    expect(sideband.spoken).toEqual(["The coding session replied: Answer A.\nAnswer B."])
+    expect(statuses).not.toContain("task_1:done")
+    expect(statuses).not.toContain("task_2:done")
+    stream.emit({ type: "session.execution.succeeded", data: { sessionID: "main" } })
+    await settle()
+    expect(sideband.spoken).toHaveLength(1)
+    expect(statuses).toContain("task_1:done")
+    expect(statuses).toContain("task_2:done")
+    bridge.close()
+  })
+
   test("a rejected prompt is spoken once and emits a failed status", async () => {
     const { bridge, sideband, statuses, prompt } = harness()
     const result = bridge.send("Inspect the project")

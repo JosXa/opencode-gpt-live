@@ -123,6 +123,9 @@ export class Bridge {
   private mainBusy = false
   private mainLabel: string | undefined
   private mainText = ""
+  private mainMessageID: string | undefined
+  private readonly mainTextParts = new Map<number, string>()
+  private mainReplyAnnounced = false
   private cancelRequested = false
   private closed = false
   private ending = false
@@ -402,6 +405,9 @@ export class Bridge {
         this.promoteQueued()
         this.mainBusy = true
         this.mainText = ""
+        this.mainMessageID = undefined
+        this.mainTextParts.clear()
+        this.mainReplyAnnounced = false
         this.mainLabel = "thinking"
         this.cancelRequested = false
         this.events.activity("main", true, this.mainLabel)
@@ -411,8 +417,30 @@ export class Bridge {
         this.mainLabel = toolLabel(data.name)
         this.events.activity("main", true, this.mainLabel)
         return
+      case "session.step.started":
+        this.mainMessageID = String(data.assistantMessageID)
+        this.mainText = ""
+        this.mainTextParts.clear()
+        return
       case "session.text.ended":
-        if (typeof data.text === "string" && data.text.trim()) this.mainText = data.text
+        if (typeof data.text === "string" && data.text.trim()) {
+          this.mainTextParts.set(typeof data.ordinal === "number" ? data.ordinal : 0, data.text)
+          this.mainText = [...this.mainTextParts.entries()]
+            .toSorted(([a], [b]) => a - b)
+            .map(([, text]) => text)
+            .join("\n")
+        }
+        return
+      case "session.step.ended":
+        // One execution drains queued prompts before going idle. Forward each final answer now,
+        // without claiming which tasks it completes: steering can combine several requests.
+        if (data.finish === "stop" && String(data.assistantMessageID) === this.mainMessageID) {
+          const text = speakable(this.mainText)
+          if (text) {
+            this.announce(`The coding session replied: ${text}`)
+            this.mainReplyAnnounced = true
+          }
+        }
         return
       case "session.execution.succeeded":
         this.finishMain("done")
@@ -448,12 +476,16 @@ export class Bridge {
     this.mainBusy = false
     this.mainLabel = undefined
     this.events.activity("main", false)
+    const outcomes = taskOutcomes([...this.tasks.values()], outcome, {
+      error,
+      result: speakable(this.mainText),
+      cancelledByUser: this.cancelRequested,
+    })
+    // Answers already reached GPT-Live at their message boundary; idle only settles task status.
     this.applyOutcomes(
-      taskOutcomes([...this.tasks.values()], outcome, {
-        error,
-        result: speakable(this.mainText),
-        cancelledByUser: this.cancelRequested,
-      }),
+      outcome === "done" && this.mainReplyAnnounced
+        ? outcomes.map((result) => ({ ...result, spoken: undefined }))
+        : outcomes,
     )
   }
 
