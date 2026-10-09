@@ -8,7 +8,7 @@ import type { RGBA, Renderable, TextRenderable } from "@opentui/core"
 import { AuraCanvas, type AuraPalette, type Rgb } from "./aura"
 import type { Entry, VoiceController } from "./controller"
 import { type Core, useCore as provideCore } from "./core"
-import { debug, fallbackSurface, pickSurface, type Surface } from "./surface"
+import { debug, fallbackSurface, pickSurface, textInterval, type Surface } from "./surface"
 import { duration, flap, pulse, shimmer, spinner } from "./visuals"
 
 type Context = Plugin.Context
@@ -110,7 +110,7 @@ export interface View {
   update(now: number): void
   /** True while the view needs frame-by-frame redraws. */
   animating(now: number): boolean
-  /** Preferred frame interval in milliseconds while animating (default 33). */
+  /** Preferred frame interval in milliseconds while animating (default textInterval()). */
   interval?(): number
   /** Hides anything drawn outside the renderable tree (e.g. herdr image layers). */
   suspend?(): void
@@ -434,7 +434,7 @@ export function transcriptPanel(context: Context, voice: VoiceController, visibl
   return {
     root,
     animating: (now) => voice.active || voice.state.entries.some((entry) => entryAnimating(entry, now)),
-    interval: () => (aura.animating(Date.now()) ? aura.interval!() : 33),
+    interval: () => (aura.animating(Date.now()) ? aura.interval!() : textInterval()),
     suspend: () => aura.suspend!(),
     dispose: () => aura.dispose!(),
     update(now) {
@@ -529,7 +529,8 @@ export function footerBadge(context: Context, voice: VoiceController): View {
 
 /**
  * Drives every mounted view: redraws on state changes, and while anything is animating at
- * the fastest rate an animating view asks for (60 fps for the image aura, else 30). Views whose renderables were removed by the host are dropped automatically.
+ * the fastest rate an animating view asks for (30 fps for the image aura; text animations at
+ * textInterval). Views whose renderables were removed by the host are dropped automatically.
  */
 export class Frames {
   private readonly views = new Set<View>()
@@ -552,7 +553,7 @@ export class Frames {
   private tick() {
     const now = Date.now()
     let animating = false
-    let period = 33
+    let period = textInterval()
     for (const view of this.views) {
       if (view.root.isDestroyed) {
         view.dispose?.()
@@ -564,7 +565,7 @@ export class Frames {
         this.failures.delete(view)
         if (view.animating(now)) {
           animating = true
-          period = Math.min(period, view.interval?.() ?? 33)
+          period = Math.min(period, view.interval?.() ?? textInterval())
         }
       } catch (error) {
         // Keep other views and the call alive if one view fails to draw; the view stays

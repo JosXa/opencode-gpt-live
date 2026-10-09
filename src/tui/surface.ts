@@ -43,13 +43,25 @@ export function debug(entry: Record<string, unknown>) {
   }
 }
 
+export function multiplexed(env: NodeJS.ProcessEnv = process.env) {
+  return !!(env.TMUX || env.STY || env.ZELLIJ)
+}
+
+/**
+ * Frame interval for animations drawn as text. Every text frame is a full OpenTUI render that
+ * hides and restores the cursor. A multiplexer replays each frame into the outer terminal, so
+ * at 30 fps typing stutters and the cursor flickers; 10 fps keeps the motion and the prompt calm.
+ */
+export function textInterval(env: NodeJS.ProcessEnv = process.env) {
+  return multiplexed(env) ? 100 : 33
+}
+
 export function pickSurface(context: Context, layer: string, rows: number): Surface {
   const renderer = context.renderer
   const forced = (context.options as { visual?: string }).visual ?? process.env.GPT_LIVE_VISUAL
   // A multiplexer nested inside herdr inherits herdr's environment, but herdr's pane
   // coordinates no longer match what is on screen.
-  const nested = !!(process.env.TMUX || process.env.STY || process.env.ZELLIJ)
-  const herdr = nested ? undefined : detectHerdr()
+  const herdr = multiplexed() ? undefined : detectHerdr()
   const write = rawWriter(renderer)
   const kind =
     forced === "blocks" || forced === "kitty" || forced === "herdr"
@@ -214,7 +226,7 @@ function blockSurface(renderer: Renderer, rows: number): Surface {
   }
   return {
     kind: "blocks",
-    interval: 33,
+    interval: textInterval(),
     node: box,
     healthy: () => !box.isDestroyed,
     draw(paint, cols, surfaceRows, background) {
