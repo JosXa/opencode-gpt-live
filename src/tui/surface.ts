@@ -61,14 +61,17 @@ export function pickSurface(context: Context, layer: string, rows: number): Surf
   const forced = (context.options as { visual?: string }).visual ?? process.env.GPT_LIVE_VISUAL
   // A multiplexer nested inside herdr inherits herdr's environment, but herdr's pane
   // coordinates no longer match what is on screen.
-  const herdr = multiplexed() ? undefined : detectHerdr()
+  const nested = multiplexed()
+  const herdr = nested ? undefined : detectHerdr()
   const write = rawWriter(renderer)
+  // A multiplexer that reports kitty graphics (tmux attached to Ghostty) still parses and
+  // forwards every image: about 2 MB/s at 30 fps, which stalls every pane it hosts.
   const kind =
     forced === "blocks" || forced === "kitty" || forced === "herdr"
       ? forced
       : herdr
         ? "herdr"
-        : renderer.capabilities?.kitty_graphics
+        : renderer.capabilities?.kitty_graphics && !nested
           ? "kitty"
           : "blocks"
   debug({ event: "surface", layer, kind, forced, herdr: !!herdr, writer: !!write, capabilities: renderer.capabilities })
